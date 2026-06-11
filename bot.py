@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import logging
 import asyncio
 import aiohttp
@@ -9,6 +10,9 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import BufferedInputFile, InputMediaPhoto, InputMediaVideo
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+
+# Імпортуємо Pillow для стиснення великих зображень
+from PIL import Image
 
 # Завантаження змінних оточення (Railway підставляє їх автоматично)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -35,7 +39,7 @@ def get_browser_headers(referer: str = None) -> dict:
     """Генерує стандартні заголовки браузера для скачування картинок"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
         "Sec-Ch-Ua-Platform": '"Windows"',
         "Sec-Fetch-Dest": "image",
@@ -45,6 +49,43 @@ def get_browser_headers(referer: str = None) -> dict:
     if referer:
         headers["Referer"] = referer
     return headers
+
+def compress_image_if_needed(img_bytes: bytes) -> bytes:
+    """
+    Перевіряє розмір зображення. Якщо він перевищує 10 МБ (ліміт Telegram),
+    стискає його за допомогою Pillow до безпечного розміру.
+    """
+    limit_10mb = 10 * 1024 * 1024  # 10,485,760 байт
+    if len(img_bytes) <= limit_10mb:
+        return img_bytes
+
+    logger.info(f"⚠️ Файл занадто великий ({len(img_bytes)} байт). Починаю стиснення...")
+    try:
+        # Відкриваємо зображення з буфера пам'яті
+        img = Image.open(io.BytesIO(img_bytes))
+        
+        # Конвертуємо в RGB, якщо це RGBA (наприклад, PNG з прозорістю), оскільки зберігати будемо в JPEG
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        
+        # Спроба 1: Зберегти в JPEG з хорошою якістю 85%
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=85)
+        compressed_bytes = out.getvalue()
+        
+        # Спроба 2: Якщо все ще > 10МБ, зменшуємо роздільну здатність і якість
+        if len(compressed_bytes) > limit_10mb:
+            logger.info("Файл все ще великий. Зменшую якість та роздільну здатність...")
+            img.thumbnail((3500, 3500))  # Зменшуємо максимальну сторону до 3500px
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=75)
+            compressed_bytes = out.getvalue()
+            
+        logger.info(f"✅ Стиснення завершено. Новий розмір: {len(compressed_bytes)} байт")
+        return compressed_bytes
+    except Exception as e:
+        logger.error(f"💥 Помилка при стисненні зображення: {e}")
+        return img_bytes  # Повертаємо оригінал, якщо стиснення не вдалося
 
 async def download_file(url: str, headers: dict = None) -> bytes:
     """Завантажує файл у бінарний буфер без збереження на диск"""
@@ -80,9 +121,7 @@ async def get_twitter_media(status_id: str, author_handle: str, original_url: st
                     tweet = data
                 
                 author = tweet.get("author", {})
-                user_name = author.get("name", author_handle)
                 user_screen_name = author.get("screen_name", author_handle)
-                author_link = f"https://x.com/{user_screen_name}"
                 
                 # Збір медіафайлів
                 media_list = []
@@ -91,10 +130,9 @@ async def get_twitter_media(status_id: str, author_handle: str, original_url: st
                 
                 if all_media:
                     for m in all_media:
-                        m_type = m.get("type")  # Може бути "photo", "video", "gif"
+                        m_type = m.get("type")
                         url = m.get("url")
                         if url:
-                            # Зберігаємо точний тип для подальшої обробки
                             if m_type == "gif":
                                 m_type = "gif"
                             elif m_type == "video":
@@ -103,7 +141,6 @@ async def get_twitter_media(status_id: str, author_handle: str, original_url: st
                                 m_type = "photo"
                             media_list.append({"type": m_type, "url": url})
                 else:
-                    # Резервний пошук, якщо немає масиву 'all'
                     photos = media_data.get("photos", [])
                     for p in photos:
                         if p.get("url"):
@@ -113,7 +150,6 @@ async def get_twitter_media(status_id: str, author_handle: str, original_url: st
                         if v.get("url"):
                             media_list.append({"type": "video", "url": v.get("url")})
                 
-                # Додатковий резервний перевірочний блок для vxtwitter формату
                 if not media_list and "attachments" in data:
                     for att in data["attachments"]:
                         att_type = att.get("type")
@@ -124,8 +160,7 @@ async def get_twitter_media(status_id: str, author_handle: str, original_url: st
                 
                 logger.info(f"📊 Знайдено медіа у твіті: {len(media_list)}")
                 return {
-                    "author_name": f"{user_name} (@{user_screen_name})",
-                    "author_link": author_link,
+                    "author_tag": user_screen_name,
                     "media_list": media_list,
                     "source_url": original_url
                 }
@@ -134,7 +169,7 @@ async def get_twitter_media(status_id: str, author_handle: str, original_url: st
     return None
 
 async def get_pixiv_media(illust_id: str, original_url: str):
-    """Отримує оригінальний арт з Pixiv за допомогою проксі-сервісу pixiv.cat (завжди фото)"""
+    """Отримує оригінальний арт з Pixiv за допомогою проксі-сервісу pixiv.cat"""
     api_url = f"https://www.pixiv.net/ajax/illust/{illust_id}"
     logger.info(f"🔍 Запит до Pixiv API: {api_url}")
     
@@ -152,8 +187,7 @@ async def get_pixiv_media(illust_id: str, original_url: str):
                 if response.status != 200:
                     logger.warning("⚠️ Pixiv API повернув помилку. Вмикаю аварійний режим...")
                     return {
-                        "author_name": "Pixiv Artist",
-                        "author_link": f"https://www.pixiv.net/artworks/{illust_id}",
+                        "author_tag": "Pixiv_Artist",
                         "media_list": [{"type": "photo", "url": f"https://pixiv.cat/{illust_id}.png"}],
                         "source_url": original_url
                     }
@@ -163,9 +197,11 @@ async def get_pixiv_media(illust_id: str, original_url: str):
                     return None
                 
                 body = data.get("body", {})
-                author_name = body.get("userName", "Unknown Pixiv Artist")
-                author_id = body.get("userId", "")
-                author_link = f"https://www.pixiv.net/users/{author_id}" if author_id else "https://www.pixiv.net"
+                author_name = body.get("userName", "Pixiv_Artist")
+                # Видаляємо пробіли та спецсимволи, щоб зробити гарний тег автора
+                author_tag = re.sub(r'[^\w_]', '', author_name.replace(' ', '_'))
+                if not author_tag:
+                    author_tag = "Pixiv_Artist"
                 
                 page_count = body.get("pageCount", 1)
                 
@@ -177,16 +213,14 @@ async def get_pixiv_media(illust_id: str, original_url: str):
                         media_list.append({"type": "photo", "url": f"https://pixiv.cat/{illust_id}-{p}.png"})
                 
                 return {
-                    "author_name": author_name,
-                    "author_link": author_link,
+                    "author_tag": author_tag,
                     "media_list": media_list,
                     "source_url": original_url
                 }
         except Exception as e:
             logger.error(f"💥 Помилка Pixiv API: {e}")
             return {
-                "author_name": "Pixiv Artist",
-                "author_link": f"https://www.pixiv.net/artworks/{illust_id}",
+                "author_tag": "Pixiv_Artist",
                 "media_list": [{"type": "photo", "url": f"https://pixiv.cat/{illust_id}.png"}],
                 "source_url": original_url
             }
@@ -200,8 +234,8 @@ async def cmd_start(message: types.Message):
         return
     await message.reply(
         "👋 Бот оновлений!\n\n"
-        "Я працюю з **Twitter (X)** та **Pixiv**.\n"
-        "Додано окреме завантаження **GIF-файлів** (без появи відео-плеєра в Telegram)!"
+        "• Додано автостиснення зображень більше 10MB\n"
+        "• Підписи тепер лаконічні та посилаються на ваше повідомлення"
     )
 
 @dp.message(F.text)
@@ -209,7 +243,7 @@ async def handle_links(message: types.Message):
     if message.chat.type == "private" and not is_admin(message.from_user.id):
         return
 
-    text = message.text
+    text = message.text.strip()
     twitter_match = TWITTER_REGEX.search(text)
     pixiv_match = PIXIV_REGEX.search(text)
     
@@ -232,15 +266,14 @@ async def handle_links(message: types.Message):
         illust_id = pixiv_match.group(1)
         original_url = pixiv_match.group(0)
         media_data = await get_pixiv_media(illust_id, original_url)
-        headers_for_download = {}  # Для pixiv.cat заголовки не потрібні
+        headers_for_download = {}
 
     # Перевірка отриманих даних
     if not media_data or not media_data.get("media_list"):
         await status_msg.edit_text("❌ Не вдалося отримати медіа-файли за цим посиланням.")
         return
 
-    author_name = media_data["author_name"]
-    author_link = media_data["author_link"]
+    author_tag = media_data["author_tag"].lstrip("@")
     source_url = media_data["source_url"]
     media_list = media_data["media_list"]
 
@@ -257,6 +290,10 @@ async def handle_links(message: types.Message):
         logger.info(f"⬇️ Завантаження файлу ({item['type']}): {item['url'][:80]}...")
         file_bytes = await download_file(item["url"], headers=headers_for_download)
         if file_bytes:
+            # ОПТИМІЗАЦІЯ РОЗМІРУ: Стискаємо фотографію, якщо вона занадто велика
+            if item["type"] == "photo":
+                file_bytes = compress_image_if_needed(file_bytes)
+                
             downloaded_items.append({
                 "type": item["type"],
                 "bytes": file_bytes
@@ -266,7 +303,8 @@ async def handle_links(message: types.Message):
         await status_msg.edit_text("❌ Помилка: Не вдалося завантажити файли з серверів.")
         return
 
-    caption_text = f"🎨 Автор: <a href='{author_link}'>{author_name}</a>\n🔗 <a href='{source_url}'>Джерело</a>{warning_suffix}"
+    # Формуємо підпис: "Автор: @тег" (у гіперпосиланні саме те лінк, яке надіслали ви)
+    caption_text = f"Автор: <a href='{source_url}'>@{author_tag}</a>{warning_suffix}"
 
     try:
         if len(downloaded_items) == 1:
@@ -275,16 +313,12 @@ async def handle_links(message: types.Message):
                 photo_file = BufferedInputFile(item["bytes"], filename="artwork.jpg")
                 await bot.send_photo(chat_id=TARGET_CHAT_ID, photo=photo_file, caption=caption_text)
             elif item["type"] == "gif":
-                # Надсилаємо як анімацію (GIF). Telegram чудово сприймає MP4-файл як циклічну анімацію
                 gif_file = BufferedInputFile(item["bytes"], filename="animation.mp4")
                 await bot.send_animation(chat_id=TARGET_CHAT_ID, animation=gif_file, caption=caption_text)
             else:  # video
                 video_file = BufferedInputFile(item["bytes"], filename="video.mp4")
                 await bot.send_video(chat_id=TARGET_CHAT_ID, video=video_file, caption=caption_text)
         else:
-            # Створення медіагрупи (альбому).
-            # Оскільки Telegram API не дозволяє змішувати InputMediaAnimation в одному альбомі з фото,
-            # у випадку наявності кількох медіафайлів (що є рідкістю для GIF) ми обробляємо GIF як InputMediaVideo.
             media_group = []
             for idx, item in enumerate(downloaded_items):
                 caption = caption_text if idx == 0 else None
@@ -295,7 +329,7 @@ async def handle_links(message: types.Message):
                             caption=caption
                         )
                     )
-                else:  # video або gif у складі альбому
+                else:  # video або gif
                     media_group.append(
                         InputMediaVideo(
                             media=BufferedInputFile(item["bytes"], filename=f"video_{idx}.mp4"),
@@ -304,7 +338,7 @@ async def handle_links(message: types.Message):
                     )
             await bot.send_media_group(chat_id=TARGET_CHAT_ID, media=media_group)
 
-        await status_msg.edit_text("✅ Публікацію успішно виконано!")
+        await status_msg.edit_text("✅ Публікацію успішно виконано у каналі!")
     except Exception as e:
         logger.error(f"💥 Помилка Telegram відправки: {e}")
         await status_msg.edit_text(f"❌ Помилка відправки в Telegram: {e}")
