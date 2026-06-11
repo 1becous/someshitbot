@@ -94,8 +94,13 @@ async def get_twitter_media(status_id: str, author_handle: str, original_url: st
                         m_type = m.get("type")  # Може бути "photo", "video", "gif"
                         url = m.get("url")
                         if url:
-                            # Telegram обробляє GIF-файли з Twitter як стандартні MP4 відео
-                            m_type = "video" if m_type in ["video", "gif"] else "photo"
+                            # Зберігаємо точний тип для подальшої обробки
+                            if m_type == "gif":
+                                m_type = "gif"
+                            elif m_type == "video":
+                                m_type = "video"
+                            else:
+                                m_type = "photo"
                             media_list.append({"type": m_type, "url": url})
                 else:
                     # Резервний пошук, якщо немає масиву 'all'
@@ -114,7 +119,7 @@ async def get_twitter_media(status_id: str, author_handle: str, original_url: st
                         att_type = att.get("type")
                         url = att.get("url")
                         if url:
-                            m_type = "video" if att_type in ["video", "gif"] else "photo"
+                            m_type = "gif" if att_type == "gif" else ("video" if att_type == "video" else "photo")
                             media_list.append({"type": m_type, "url": url})
                 
                 logger.info(f"📊 Знайдено медіа у твіті: {len(media_list)}")
@@ -195,8 +200,8 @@ async def cmd_start(message: types.Message):
         return
     await message.reply(
         "👋 Бот оновлений!\n\n"
-        "Тепер я працюю виключно з **Twitter (X)** та **Pixiv**.\n"
-        "Додано повну підтримку завантаження **відео та GIF-файлів** з Twitter!"
+        "Я працюю з **Twitter (X)** та **Pixiv**.\n"
+        "Додано окреме завантаження **GIF-файлів** (без появи відео-плеєра в Telegram)!"
     )
 
 @dp.message(F.text)
@@ -214,7 +219,6 @@ async def handle_links(message: types.Message):
     status_msg = await message.reply("⏳ Опрацьовую лінк та завантажую медіа...")
     media_data = None
     
-    # Заголовки за замовчуванням
     headers_for_download = get_browser_headers()
 
     # 1. Твіттер
@@ -240,10 +244,9 @@ async def handle_links(message: types.Message):
     source_url = media_data["source_url"]
     media_list = media_data["media_list"]
 
-    # Обмеження Telegram на медіагрупи (максимум 10 елементів)
     if len(media_list) > 10:
         media_list = media_list[:10]
-        warning_suffix = "\n⚠️ <i>(Показано перші 10 елементів галереї)</i>"
+        warning_suffix = "\n⚠️ <i>(Показано перші 10 елементів)</i>"
     else:
         warning_suffix = ""
 
@@ -271,11 +274,17 @@ async def handle_links(message: types.Message):
             if item["type"] == "photo":
                 photo_file = BufferedInputFile(item["bytes"], filename="artwork.jpg")
                 await bot.send_photo(chat_id=TARGET_CHAT_ID, photo=photo_file, caption=caption_text)
-            else:  # video (або GIF)
+            elif item["type"] == "gif":
+                # Надсилаємо як анімацію (GIF). Telegram чудово сприймає MP4-файл як циклічну анімацію
+                gif_file = BufferedInputFile(item["bytes"], filename="animation.mp4")
+                await bot.send_animation(chat_id=TARGET_CHAT_ID, animation=gif_file, caption=caption_text)
+            else:  # video
                 video_file = BufferedInputFile(item["bytes"], filename="video.mp4")
                 await bot.send_video(chat_id=TARGET_CHAT_ID, video=video_file, caption=caption_text)
         else:
-            # Створення медіагрупи (підтримує змішування фото та відео)
+            # Створення медіагрупи (альбому).
+            # Оскільки Telegram API не дозволяє змішувати InputMediaAnimation в одному альбомі з фото,
+            # у випадку наявності кількох медіафайлів (що є рідкістю для GIF) ми обробляємо GIF як InputMediaVideo.
             media_group = []
             for idx, item in enumerate(downloaded_items):
                 caption = caption_text if idx == 0 else None
@@ -286,7 +295,7 @@ async def handle_links(message: types.Message):
                             caption=caption
                         )
                     )
-                else:  # video
+                else:  # video або gif у складі альбому
                     media_group.append(
                         InputMediaVideo(
                             media=BufferedInputFile(item["bytes"], filename=f"video_{idx}.mp4"),
