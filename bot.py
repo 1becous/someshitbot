@@ -6,7 +6,7 @@ import aiohttp
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import BufferedInputFile, InputMediaPhoto
+from aiogram.types import BufferedInputFile, InputMediaPhoto, InputMediaVideo
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
@@ -27,14 +27,12 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# Регулярні вирази для лінків (додано прапорець IGNORECASE)
+# Регулярні вирази для лінків (лише Twitter/X та Pixiv)
 TWITTER_REGEX = re.compile(r'https?://(?:www\.)?(?:twitter|x)\.com/([\w_]+)/status/(\d+)', re.IGNORECASE)
 PIXIV_REGEX = re.compile(r'https?://(?:www\.)?pixiv\.net/(?:[\w-]+/)?artworks/(\d+)', re.IGNORECASE)
-THREADS_REGEX = re.compile(r'https?://(?:www\.)?threads\.(?:net|com)/(?:@(?P<user>[\w_.]+)/post/|t/)(?P<id>[\w_-]+)', re.IGNORECASE)
-INSTAGRAM_REGEX = re.compile(r'https?://(?:www\.)?instagram\.com/(?:[^/]+/)?(?:p|reel|reels)/([\w_-]+)', re.IGNORECASE)
 
 def get_browser_headers(referer: str = None) -> dict:
-    """Генерує стандартні заголовки браузера для скачування картинок з CDN"""
+    """Генерує стандартні заголовки браузера для скачування картинок"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
@@ -48,45 +46,6 @@ def get_browser_headers(referer: str = None) -> dict:
         headers["Referer"] = referer
     return headers
 
-def extract_meta_images(html: str) -> list:
-    """
-    Резервний парсер метатегів HTML.
-    Пріоритет віддається twitter:image, оскільки Meta рідше обрізає його для Twitter-картки.
-    """
-    twitter_images = []
-    og_images = []
-    meta_tags = re.findall(r'<meta\s+[^>]*>', html, re.IGNORECASE)
-    
-    for tag in meta_tags:
-        tag_lower = tag.lower()
-        content_match = re.search(r'content=["\']([^"\']+)["\']', tag, re.IGNORECASE)
-        if not content_match:
-            continue
-            
-        url = content_match.group(1).replace("&amp;", "&")
-        if not url or "pb=" in url or "static" in url:
-            continue
-            
-        if 'twitter:image' in tag_lower:
-            if url not in twitter_images:
-                twitter_images.append(url)
-        elif 'og:image' in tag_lower or 'og:image:secure_url' in tag_lower:
-            if url not in og_images:
-                og_images.append(url)
-                
-    # Якщо є twitter:image (воно зазвичай не обрізане), беремо його, інакше og:image
-    return twitter_images if twitter_images else og_images
-
-def extract_meta_title(html: str) -> str:
-    """Витягує заголовок сторінки для визначення імені автора"""
-    meta_tags = re.findall(r'<meta\s+[^>]*>', html, re.IGNORECASE)
-    for tag in meta_tags:
-        if 'title' in tag.lower():
-            content_match = re.search(r'content=["\']([^"\']+)["\']', tag, re.IGNORECASE)
-            if content_match:
-                return content_match.group(1)
-    return ""
-
 async def download_file(url: str, headers: dict = None) -> bytes:
     """Завантажує файл у бінарний буфер без збереження на диск"""
     if not headers:
@@ -94,7 +53,7 @@ async def download_file(url: str, headers: dict = None) -> bytes:
         
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(url, headers=headers, timeout=30, ssl=False) as response:
+            async with session.get(url, headers=headers, timeout=45, ssl=False) as response:
                 if response.status == 200:
                     return await response.read()
                 else:
@@ -104,7 +63,7 @@ async def download_file(url: str, headers: dict = None) -> bytes:
     return b""
 
 async def get_twitter_media(status_id: str, author_handle: str, original_url: str):
-    """Отримує медіа та дані автора з Twitter за допомогою fxtwitter API"""
+    """Отримує медіа (фото, відео, GIF) та дані автора з Twitter за допомогою fxtwitter API"""
     api_url = f"https://api.fxtwitter.com/status/{status_id}"
     logger.info(f"🔍 Запит до Twitter API: {api_url}")
     
@@ -125,17 +84,44 @@ async def get_twitter_media(status_id: str, author_handle: str, original_url: st
                 user_screen_name = author.get("screen_name", author_handle)
                 author_link = f"https://x.com/{user_screen_name}"
                 
-                media = tweet.get("media", {})
-                photos = media.get("photos", [])
-                photo_urls = [p.get("url") for p in photos if p.get("type") == "photo"]
+                # Збір медіафайлів
+                media_list = []
+                media_data = tweet.get("media", {})
+                all_media = media_data.get("all", [])
                 
-                if not photo_urls and "attachments" in data:
-                    photo_urls = [att.get("url") for att in data["attachments"] if att.get("type") == "photo"]
+                if all_media:
+                    for m in all_media:
+                        m_type = m.get("type")  # Може бути "photo", "video", "gif"
+                        url = m.get("url")
+                        if url:
+                            # Telegram обробляє GIF-файли з Twitter як стандартні MP4 відео
+                            m_type = "video" if m_type in ["video", "gif"] else "photo"
+                            media_list.append({"type": m_type, "url": url})
+                else:
+                    # Резервний пошук, якщо немає масиву 'all'
+                    photos = media_data.get("photos", [])
+                    for p in photos:
+                        if p.get("url"):
+                            media_list.append({"type": "photo", "url": p.get("url")})
+                    videos = media_data.get("videos", [])
+                    for v in videos:
+                        if v.get("url"):
+                            media_list.append({"type": "video", "url": v.get("url")})
                 
+                # Додатковий резервний перевірочний блок для vxtwitter формату
+                if not media_list and "attachments" in data:
+                    for att in data["attachments"]:
+                        att_type = att.get("type")
+                        url = att.get("url")
+                        if url:
+                            m_type = "video" if att_type in ["video", "gif"] else "photo"
+                            media_list.append({"type": m_type, "url": url})
+                
+                logger.info(f"📊 Знайдено медіа у твіті: {len(media_list)}")
                 return {
                     "author_name": f"{user_name} (@{user_screen_name})",
                     "author_link": author_link,
-                    "media_urls": photo_urls,
+                    "media_list": media_list,
                     "source_url": original_url
                 }
         except Exception as e:
@@ -143,7 +129,7 @@ async def get_twitter_media(status_id: str, author_handle: str, original_url: st
     return None
 
 async def get_pixiv_media(illust_id: str, original_url: str):
-    """Отримує оригінальний арт з Pixiv за допомогою проксі-сервісу pixiv.cat"""
+    """Отримує оригінальний арт з Pixiv за допомогою проксі-сервісу pixiv.cat (завжди фото)"""
     api_url = f"https://www.pixiv.net/ajax/illust/{illust_id}"
     logger.info(f"🔍 Запит до Pixiv API: {api_url}")
     
@@ -163,7 +149,7 @@ async def get_pixiv_media(illust_id: str, original_url: str):
                     return {
                         "author_name": "Pixiv Artist",
                         "author_link": f"https://www.pixiv.net/artworks/{illust_id}",
-                        "media_urls": [f"https://pixiv.cat/{illust_id}.png"],
+                        "media_list": [{"type": "photo", "url": f"https://pixiv.cat/{illust_id}.png"}],
                         "source_url": original_url
                     }
                     
@@ -178,17 +164,17 @@ async def get_pixiv_media(illust_id: str, original_url: str):
                 
                 page_count = body.get("pageCount", 1)
                 
-                photo_urls = []
+                media_list = []
                 if page_count == 1:
-                    photo_urls.append(f"https://pixiv.cat/{illust_id}.png")
+                    media_list.append({"type": "photo", "url": f"https://pixiv.cat/{illust_id}.png"})
                 else:
                     for p in range(1, page_count + 1):
-                        photo_urls.append(f"https://pixiv.cat/{illust_id}-{p}.png")
+                        media_list.append({"type": "photo", "url": f"https://pixiv.cat/{illust_id}-{p}.png"})
                 
                 return {
                     "author_name": author_name,
                     "author_link": author_link,
-                    "media_urls": photo_urls,
+                    "media_list": media_list,
                     "source_url": original_url
                 }
         except Exception as e:
@@ -196,154 +182,9 @@ async def get_pixiv_media(illust_id: str, original_url: str):
             return {
                 "author_name": "Pixiv Artist",
                 "author_link": f"https://www.pixiv.net/artworks/{illust_id}",
-                "media_urls": [f"https://pixiv.cat/{illust_id}.png"],
+                "media_list": [{"type": "photo", "url": f"https://pixiv.cat/{illust_id}.png"}],
                 "source_url": original_url
             }
-
-async def get_threads_media(username: str, post_id: str, original_url: str):
-    """Отримує ПОВНИЙ набір нестиснутих зображень з Threads за допомогою JSON API"""
-    api_url = f"https://api.fixthreads.net/v1/post/{post_id}"
-    logger.info(f"🔍 Запит до Threads JSON API: {api_url}")
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(api_url, timeout=12, ssl=False) as response:
-                logger.info(f"📡 Threads JSON API статус відповіді: {response.status}")
-                if response.status == 200:
-                    data = await response.json()
-                    item = data.get("item", {})
-                    if item:
-                        # Дістаємо автора
-                        author_data = item.get("author", {})
-                        author_name = author_data.get("username") or author_data.get("name") or username or "Threads Artist"
-                        if not author_name.startswith("@"):
-                            author_name = f"@{author_name}"
-                        author_link = f"https://www.threads.net/{author_name}"
-                        
-                        # Збираємо всі оригінальні фото з каруселі
-                        photo_urls = []
-                        media_list = item.get("media", [])
-                        for m in media_list:
-                            if m.get("type") in ["image", "photo"] or "video" not in m.get("type", "").lower():
-                                url = m.get("url")
-                                if url:
-                                    photo_urls.append(url.replace("&amp;", "&"))
-                                    
-                        if photo_urls:
-                            logger.info(f"📸 Знайдено {len(photo_urls)} чистих оригінальних фото Threads через API")
-                            return {
-                                "author_name": author_name,
-                                "author_link": author_link,
-                                "media_urls": photo_urls,
-                                "source_url": original_url
-                            }
-        except Exception as e:
-            logger.error(f"💥 Помилка Threads JSON API: {e}")
-            
-    # РЕЗЕРВНИЙ ВАРІАНТ: Прямий парсинг сторінки
-    logger.warning("⚠️ Threads API не повернув результат. Перемикаюсь на резервний HTML-парсинг...")
-    direct_url = f"https://www.threads.net/t/{post_id}"
-    headers = {"User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uated.html)"}
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(direct_url, headers=headers, timeout=15, ssl=False) as response:
-                if response.status == 200:
-                    html = await response.text()
-                    photo_urls = extract_meta_images(html)
-                    if photo_urls:
-                        raw_title = extract_meta_title(html)
-                        author_name = f"@{username}" if username else "Threads Artist"
-                        if raw_title:
-                            author_name = raw_title.split("on Threads")[0].strip() if "on Threads" in raw_title else raw_title
-                        
-                        return {
-                            "author_name": author_name,
-                            "author_link": f"https://www.threads.net/@{username}" if username else "https://www.threads.net",
-                            "media_urls": photo_urls,
-                            "source_url": original_url
-                        }
-        except Exception as e:
-            logger.error(f"💥 Помилка резервного парсингу Threads: {e}")
-            
-    return None
-
-async def get_instagram_media(code: str, original_url: str):
-    """Отримує ПОВНИЙ набір нестиснутих зображень з Instagram за допомогою JSON API"""
-    proxies = ["api.instagrame.com", "api.ddinstagram.com"]
-    
-    for domain in proxies:
-        api_url = f"https://{domain}/v1/post/{code}"
-        logger.info(f"🔍 Запит до Instagram JSON API ({domain}): {api_url}")
-        
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(api_url, timeout=12, ssl=False) as response:
-                    logger.info(f"📡 Instagram JSON API status: {response.status}")
-                    if response.status == 200:
-                        data = await response.json()
-                        item = data.get("item", {})
-                        if item:
-                            # Дістаємо автора
-                            author_data = item.get("author", {})
-                            author_name = author_data.get("username") or author_data.get("name") or "Instagram Artist"
-                            if not author_name.startswith("@") and author_name != "Instagram Artist":
-                                author_name = f"@{author_name}"
-                            author_link = f"https://www.instagram.com/{author_name.replace('@', '')}"
-                            
-                            # Збираємо всі нестиснуті фото з каруселі
-                            photo_urls = []
-                            media_list = item.get("media", [])
-                            for m in media_list:
-                                if m.get("type") in ["image", "photo"] or "video" not in m.get("type", "").lower():
-                                    url = m.get("url")
-                                    if url:
-                                        photo_urls.append(url.replace("&amp;", "&"))
-                                        
-                            if photo_urls:
-                                logger.info(f"📸 Знайдено {len(photo_urls)} чистих оригінальних фото Instagram через API")
-                                return {
-                                    "author_name": author_name,
-                                    "author_link": author_link,
-                                    "media_urls": photo_urls,
-                                    "source_url": original_url
-                                }
-            except Exception as e:
-                logger.error(f"💥 Помилка Instagram JSON API ({domain}): {e}")
-                
-    # РЕЗЕРВНИЙ ВАРІАНТ: Прямий парсинг сторінки
-    logger.warning("⚠️ Instagram API не повернув результат. Перемикаюсь на резервний HTML-парсинг...")
-    direct_url = f"https://www.instagram.com/p/{code}/"
-    headers = {"User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uated.html)"}
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(direct_url, headers=headers, timeout=15, ssl=False) as response:
-                if response.status == 200:
-                    html = await response.text()
-                    photo_urls = extract_meta_images(html)
-                    if photo_urls:
-                        raw_title = extract_meta_title(html)
-                        author_name = "Instagram Artist"
-                        author_link = "https://www.instagram.com"
-                        if raw_title:
-                            author_name = raw_title
-                            user_match = re.search(r'@([\w_.]+)', raw_title)
-                            if user_match:
-                                username = user_match.group(1)
-                                author_link = f"https://www.instagram.com/{username}"
-                                author_name = f"@{username}"
-                        
-                        return {
-                            "author_name": author_name,
-                            "author_link": author_link,
-                            "media_urls": photo_urls,
-                            "source_url": original_url
-                        }
-        except Exception as e:
-            logger.error(f"💥 Помилка резервного парсингу Instagram: {e}")
-            
-    return None
 
 def is_admin(user_id: int) -> bool:
     return not ADMIN_IDS or user_id in ADMIN_IDS
@@ -353,9 +194,9 @@ async def cmd_start(message: types.Message):
     if not is_admin(message.from_user.id):
         return
     await message.reply(
-        "👋 Бот повністю оновлений!\n\n"
-        "Тепер для Instagram та Threads інтегровано підтримку завантаження "
-        "**усіх зображень галереї (каруселей)** в оригінальній якості без обрізання!"
+        "👋 Бот оновлений!\n\n"
+        "Тепер я працюю виключно з **Twitter (X)** та **Pixiv**.\n"
+        "Додано повну підтримку завантаження **відео та GIF-файлів** з Twitter!"
     )
 
 @dp.message(F.text)
@@ -366,15 +207,14 @@ async def handle_links(message: types.Message):
     text = message.text
     twitter_match = TWITTER_REGEX.search(text)
     pixiv_match = PIXIV_REGEX.search(text)
-    threads_match = THREADS_REGEX.search(text)
-    instagram_match = INSTAGRAM_REGEX.search(text)
     
-    if not any([twitter_match, pixiv_match, threads_match, instagram_match]):
+    if not any([twitter_match, pixiv_match]):
         return
 
-    status_msg = await message.reply("⏳ Починаю завантаження оригінальних зображень...")
+    status_msg = await message.reply("⏳ Опрацьовую лінк та завантажую медіа...")
     media_data = None
     
+    # Заголовки за замовчуванням
     headers_for_download = get_browser_headers()
 
     # 1. Твіттер
@@ -388,77 +228,80 @@ async def handle_links(message: types.Message):
         illust_id = pixiv_match.group(1)
         original_url = pixiv_match.group(0)
         media_data = await get_pixiv_media(illust_id, original_url)
-        headers_for_download = {}
-        
-    # 3. Threads
-    elif threads_match:
-        username = threads_match.group("user")
-        post_id = threads_match.group("id")
-        original_url = threads_match.group(0)
-        media_data = await get_threads_media(username, post_id, original_url)
-        headers_for_download = get_browser_headers("https://www.threads.net/")
-        
-    # 4. Instagram
-    elif instagram_match:
-        code = instagram_match.group(1)
-        original_url = instagram_match.group(0)
-        media_data = await get_instagram_media(code, original_url)
-        headers_for_download = get_browser_headers("https://www.instagram.com/")
+        headers_for_download = {}  # Для pixiv.cat заголовки не потрібні
 
     # Перевірка отриманих даних
-    if not media_data or not media_data.get("media_urls"):
+    if not media_data or not media_data.get("media_list"):
         await status_msg.edit_text("❌ Не вдалося отримати медіа-файли за цим посиланням.")
         return
 
     author_name = media_data["author_name"]
     author_link = media_data["author_link"]
     source_url = media_data["source_url"]
-    urls = media_data["media_urls"]
+    media_list = media_data["media_list"]
 
-    if len(urls) > 10:
-        urls = urls[:10]
-        warning_suffix = "\n⚠️ <i>(Показано перші 10 зображень)</i>"
+    # Обмеження Telegram на медіагрупи (максимум 10 елементів)
+    if len(media_list) > 10:
+        media_list = media_list[:10]
+        warning_suffix = "\n⚠️ <i>(Показано перші 10 елементів галереї)</i>"
     else:
         warning_suffix = ""
 
-    await status_msg.edit_text(f"📥 Скачую оригінальні файли з CDN ({len(urls)} шт.)...")
+    await status_msg.edit_text(f"📥 Завантажую медіафайли ({len(media_list)} шт.)...")
 
-    downloaded_images = []
-    for url in urls:
-        logger.info(f"⬇️ Завантаження файлу: {url[:80]}...")
-        img_bytes = await download_file(url, headers=headers_for_download)
-        if img_bytes:
-            downloaded_images.append(img_bytes)
+    downloaded_items = []
+    for item in media_list:
+        logger.info(f"⬇️ Завантаження файлу ({item['type']}): {item['url'][:80]}...")
+        file_bytes = await download_file(item["url"], headers=headers_for_download)
+        if file_bytes:
+            downloaded_items.append({
+                "type": item["type"],
+                "bytes": file_bytes
+            })
 
-    if not downloaded_images:
-        await status_msg.edit_text("❌ Помилка: Не вдалося завантажити картинки з серверів.")
+    if not downloaded_items:
+        await status_msg.edit_text("❌ Помилка: Не вдалося завантажити файли з серверів.")
         return
 
     caption_text = f"🎨 Автор: <a href='{author_link}'>{author_name}</a>\n🔗 <a href='{source_url}'>Джерело</a>{warning_suffix}"
 
     try:
-        if len(downloaded_images) == 1:
-            photo = BufferedInputFile(downloaded_images[0], filename="artwork.jpg")
-            await bot.send_photo(chat_id=TARGET_CHAT_ID, photo=photo, caption=caption_text)
+        if len(downloaded_items) == 1:
+            item = downloaded_items[0]
+            if item["type"] == "photo":
+                photo_file = BufferedInputFile(item["bytes"], filename="artwork.jpg")
+                await bot.send_photo(chat_id=TARGET_CHAT_ID, photo=photo_file, caption=caption_text)
+            else:  # video (або GIF)
+                video_file = BufferedInputFile(item["bytes"], filename="video.mp4")
+                await bot.send_video(chat_id=TARGET_CHAT_ID, video=video_file, caption=caption_text)
         else:
+            # Створення медіагрупи (підтримує змішування фото та відео)
             media_group = []
-            for idx, img_bytes in enumerate(downloaded_images):
+            for idx, item in enumerate(downloaded_items):
                 caption = caption_text if idx == 0 else None
-                media_group.append(
-                    InputMediaPhoto(
-                        media=BufferedInputFile(img_bytes, filename=f"artwork_{idx}.jpg"),
-                        caption=caption
+                if item["type"] == "photo":
+                    media_group.append(
+                        InputMediaPhoto(
+                            media=BufferedInputFile(item["bytes"], filename=f"artwork_{idx}.jpg"),
+                            caption=caption
+                        )
                     )
-                )
+                else:  # video
+                    media_group.append(
+                        InputMediaVideo(
+                            media=BufferedInputFile(item["bytes"], filename=f"video_{idx}.mp4"),
+                            caption=caption
+                        )
+                    )
             await bot.send_media_group(chat_id=TARGET_CHAT_ID, media=media_group)
 
-        await status_msg.edit_text("✅ Арт успішно опубліковано у вашій групі!")
+        await status_msg.edit_text("✅ Публікацію успішно виконано!")
     except Exception as e:
         logger.error(f"💥 Помилка Telegram відправки: {e}")
         await status_msg.edit_text(f"❌ Помилка відправки в Telegram: {e}")
 
 async def main():
-    logger.info("Старт бота на Railway...")
+    logger.info("Старт бота на Railway (Twitter & Pixiv)...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
