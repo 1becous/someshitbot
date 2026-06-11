@@ -148,7 +148,6 @@ async def get_threads_media(username: str, post_id: str, original_url: str):
     fixer_url = f"https://fixthreads.net/@{username}/post/{post_id}"
     logger.info(f"🔍 Запит до Threads Fixer: {fixer_url}")
     
-    # Встановлюємо бота як User-Agent, щоб фіксер віддав метатеги замість редіректу
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
     }
@@ -161,12 +160,9 @@ async def get_threads_media(username: str, post_id: str, original_url: str):
                 
                 html = await response.text()
                 
-                # Парсимо фотографії з метатегів
                 photo_urls = re.findall(r'<meta\s+(?:property|name)=["\'](?:og|twitter):image["\']\s+content=["\']([^"\']+)["\']', html)
-                # Фільтруємо та видаляємо можливі посилання на іконки або аватарки
                 photo_urls = list(dict.fromkeys([url for url in photo_urls if url and "pb=" not in url]))
                 
-                # Парсимо ім'я автора
                 title_match = re.search(r'<meta\s+(?:property|name)=["\'](?:og|title|twitter:title)["\']\s+content=["\']([^"\']+)["\']', html)
                 author_name = f"@{username}"
                 if title_match:
@@ -184,50 +180,60 @@ async def get_threads_media(username: str, post_id: str, original_url: str):
     return None
 
 async def get_instagram_media(code: str, original_url: str):
-    """Отримує медіа та дані автора з Instagram за допомогою фіксера ddinstagram.com"""
-    fixer_url = f"https://www.ddinstagram.com/p/{code}/"
-    logger.info(f"🔍 Запит до Instagram Fixer: {fixer_url}")
+    """Отримує медіа та дані автора з Instagram за допомогою каскаду проксі-сервісів"""
+    # Список робочих дзеркал БЕЗ префіксу 'www.'
+    proxies = ["ddinstagram.com", "instagrame.com"]
     
-    # Представляємось дискорд-ботом, щоб отримати чистий HTML з OpenGraph тегами
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
-    }
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(fixer_url, headers=headers, timeout=15) as response:
-                logger.info(f"📡 Instagram статус відповіді: {response.status}")
-                if response.status != 200:
-                    return None
+    for domain in proxies:
+        fixer_url = f"https://{domain}/p/{code}/"
+        logger.info(f"🔍 Спроба отримати Instagram через: {fixer_url}")
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(fixer_url, headers=headers, timeout=15) as response:
+                    logger.info(f"📡 Instagram ({domain}) статус відповіді: {response.status}")
+                    if response.status != 200:
+                        continue
+                    
+                    html = await response.text()
+                    
+                    # Пошук посилань на оригінальні зображення в OpenGraph-метатегах
+                    photo_urls = re.findall(r'<meta\s+(?:property|name)=["\'](?:og|twitter):image["\']\s+content=["\']([^"\']+)["\']', html)
+                    photo_urls = list(dict.fromkeys([url for url in photo_urls if url]))
+                    
+                    if not photo_urls:
+                        logger.warning(f"⚠️ На {domain} не знайдено посилань на картинки, спробую інший проксі...")
+                        continue
+                    
+                    # Визначення нікнейму автора
+                    title_match = re.search(r'<meta\s+(?:property|name)=["\'](?:og|title|twitter:title)["\']\s+content=["\']([^"\']+)["\']', html)
+                    author_name = "Instagram Artist"
+                    author_link = "https://www.instagram.com"
+                    
+                    if title_match:
+                        raw_title = title_match.group(1)
+                        author_name = raw_title
+                        user_match = re.search(r'@([\w_.]+)', raw_title)
+                        if user_match:
+                            username = user_match.group(1)
+                            author_link = f"https://www.instagram.com/{username}"
+                            author_name = f"@{username}"
+                    
+                    return {
+                        "author_name": author_name,
+                        "author_link": author_link,
+                        "media_urls": photo_urls,
+                        "source_url": original_url
+                    }
+            except Exception as e:
+                logger.error(f"💥 Помилка підключення до Instagram проксі ({domain}): {e}")
+                continue
                 
-                html = await response.text()
-                
-                # Шукаємо всі посилання на картинки
-                photo_urls = re.findall(r'<meta\s+(?:property|name)=["\'](?:og|twitter):image["\']\s+content=["\']([^"\']+)["\']', html)
-                photo_urls = list(dict.fromkeys([url for url in photo_urls if url]))
-                
-                # Визначаємо нікнейм автора
-                title_match = re.search(r'<meta\s+(?:property|name)=["\'](?:og|title|twitter:title)["\']\s+content=["\']([^"\']+)["\']', html)
-                author_name = "Instagram Artist"
-                author_link = "https://www.instagram.com"
-                
-                if title_match:
-                    raw_title = title_match.group(1)
-                    author_name = raw_title
-                    # Намагаємося дістати нікнейм з формату "Name (@username)"
-                    user_match = re.search(r'@([\w_.]+)', raw_title)
-                    if user_match:
-                        username = user_match.group(1)
-                        author_link = f"https://www.instagram.com/{username}"
-                        author_name = f"@{username}"
-                
-                return {
-                    "author_name": author_name,
-                    "author_link": author_link,
-                    "media_urls": photo_urls,
-                    "source_url": original_url
-                }
-        except Exception as e:
-            logger.error(f"💥 Помилка парсингу Instagram: {e}")
+    logger.error("❌ Жоден з проксі-серверів Instagram не зміг повернути результат.")
     return None
 
 def is_admin(user_id: int) -> bool:
@@ -239,12 +245,11 @@ async def cmd_start(message: types.Message):
         return
     await message.reply(
         "👋 Бот активований та готовий до роботи!\n\n"
-        "**Підтримувані платформи:**\n"
         "• Twitter (X)\n"
-        "• Pixiv (з обходом блокувань)\n"
-        "• Threads\n"
-        "• Instagram (пости, Reels)\n\n"
-        "Просто надішліть посилання в чат."
+        "• Pixiv (через pixiv.cat)\n"
+        "• Threads (через fixthreads)\n"
+        "• Instagram (через ddinstagram/instagrame)\n\n"
+        "Надішліть посилання в чат."
     )
 
 @dp.message(F.text)
