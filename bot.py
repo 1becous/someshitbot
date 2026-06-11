@@ -33,18 +33,6 @@ PIXIV_REGEX = re.compile(r'https?://(?:www\.)?pixiv\.net/(?:[\w-]+/)?artworks/(\
 THREADS_REGEX = re.compile(r'https?://(?:www\.)?threads\.(?:net|com)/(?:@(?P<user>[\w_.]+)/post/|t/)(?P<id>[\w_-]+)', re.IGNORECASE)
 INSTAGRAM_REGEX = re.compile(r'https?://(?:www\.)?instagram\.com/(?:[^/]+/)?(?:p|reel|reels)/([\w_-]+)', re.IGNORECASE)
 
-def get_crawler_headers() -> dict:
-    """
-    Генерує заголовки офіційного краулера Facebook.
-    Meta завжди віддає краулерам чистий HTML з оригінальними посиланнями на медіа
-    і ніколи не перенаправляє їх на сторінку логіну.
-    """
-    return {
-        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uated.html)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9"
-    }
-
 def get_browser_headers(referer: str = None) -> dict:
     """Генерує стандартні заголовки браузера для скачування картинок з CDN"""
     headers = {
@@ -61,21 +49,33 @@ def get_browser_headers(referer: str = None) -> dict:
     return headers
 
 def extract_meta_images(html: str) -> list:
-    """Витягує чисті оригінальні посилання на зображення з OpenGraph метатегів"""
-    photo_urls = []
+    """
+    Резервний парсер метатегів HTML.
+    Пріоритет віддається twitter:image, оскільки Meta рідше обрізає його для Twitter-картки.
+    """
+    twitter_images = []
+    og_images = []
     meta_tags = re.findall(r'<meta\s+[^>]*>', html, re.IGNORECASE)
+    
     for tag in meta_tags:
         tag_lower = tag.lower()
-        # Шукаємо виключно оригінальні зображення в og:image або twitter:image
-        if 'og:image' in tag_lower or 'twitter:image' in tag_lower or 'og:image:secure_url' in tag_lower:
-            content_match = re.search(r'content=["\']([^"\']+)["\']', tag, re.IGNORECASE)
-            if content_match:
-                # КРИТИЧНО: Заміна &amp; на & для валідності посилань Meta CDN
-                url = content_match.group(1).replace("&amp;", "&")
-                # Уникаємо технічних логотипів, іконок чи прев'ю-карток сторонніх сервісів
-                if url and "pb=" not in url and "static" not in url and url not in photo_urls:
-                    photo_urls.append(url)
-    return photo_urls
+        content_match = re.search(r'content=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+        if not content_match:
+            continue
+            
+        url = content_match.group(1).replace("&amp;", "&")
+        if not url or "pb=" in url or "static" in url:
+            continue
+            
+        if 'twitter:image' in tag_lower:
+            if url not in twitter_images:
+                twitter_images.append(url)
+        elif 'og:image' in tag_lower or 'og:image:secure_url' in tag_lower:
+            if url not in og_images:
+                og_images.append(url)
+                
+    # Якщо є twitter:image (воно зазвичай не обрізане), беремо його, інакше og:image
+    return twitter_images if twitter_images else og_images
 
 def extract_meta_title(html: str) -> str:
     """Витягує заголовок сторінки для визначення імені автора"""
@@ -98,7 +98,7 @@ async def download_file(url: str, headers: dict = None) -> bytes:
                 if response.status == 200:
                     return await response.read()
                 else:
-                    logger.error(f"❌ ПОМИЛКА ЗАВАНТАЖЕННЯ ФАЙЛУ: статус {response.status} для URL: {url[:80]}...")
+                    logger.error(f"❌ ПОМИЛКА СКАЧУВАННЯ ФАЙЛУ: статус {response.status} для URL: {url[:80]}...")
         except Exception as e:
             logger.error(f"💥 Виняток при завантаженні файлу: {e}")
     return b""
@@ -201,98 +201,148 @@ async def get_pixiv_media(illust_id: str, original_url: str):
             }
 
 async def get_threads_media(username: str, post_id: str, original_url: str):
-    """Отримує чистий оригінальний арт з Threads напряму, минаючи проксі-сервери"""
-    # Нормалізуємо посилання на офіційний threads.net (замість threads.com)
-    if username:
-        direct_url = f"https://www.threads.net/@{username}/post/{post_id}"
-    else:
-        direct_url = f"https://www.threads.net/t/{post_id}"
-        
-    logger.info(f"🔍 Пряме сканування Threads: {direct_url}")
+    """Отримує ПОВНИЙ набір нестиснутих зображень з Threads за допомогою JSON API"""
+    api_url = f"https://api.fixthreads.net/v1/post/{post_id}"
+    logger.info(f"🔍 Запит до Threads JSON API: {api_url}")
     
-    headers = get_crawler_headers()
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(api_url, timeout=12, ssl=False) as response:
+                logger.info(f"📡 Threads JSON API статус відповіді: {response.status}")
+                if response.status == 200:
+                    data = await response.json()
+                    item = data.get("item", {})
+                    if item:
+                        # Дістаємо автора
+                        author_data = item.get("author", {})
+                        author_name = author_data.get("username") or author_data.get("name") or username or "Threads Artist"
+                        if not author_name.startswith("@"):
+                            author_name = f"@{author_name}"
+                        author_link = f"https://www.threads.net/{author_name}"
+                        
+                        # Збираємо всі оригінальні фото з каруселі
+                        photo_urls = []
+                        media_list = item.get("media", [])
+                        for m in media_list:
+                            if m.get("type") in ["image", "photo"] or "video" not in m.get("type", "").lower():
+                                url = m.get("url")
+                                if url:
+                                    photo_urls.append(url.replace("&amp;", "&"))
+                                    
+                        if photo_urls:
+                            logger.info(f"📸 Знайдено {len(photo_urls)} чистих оригінальних фото Threads через API")
+                            return {
+                                "author_name": author_name,
+                                "author_link": author_link,
+                                "media_urls": photo_urls,
+                                "source_url": original_url
+                            }
+        except Exception as e:
+            logger.error(f"💥 Помилка Threads JSON API: {e}")
+            
+    # РЕЗЕРВНИЙ ВАРІАНТ: Прямий парсинг сторінки
+    logger.warning("⚠️ Threads API не повернув результат. Перемикаюсь на резервний HTML-парсинг...")
+    direct_url = f"https://www.threads.net/t/{post_id}"
+    headers = {"User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uated.html)"}
+    
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(direct_url, headers=headers, timeout=15, ssl=False) as response:
-                logger.info(f"📡 Threads Direct статус відповіді: {response.status}")
-                if response.status != 200:
-                    return None
-                
-                html = await response.text()
-                photo_urls = extract_meta_images(html)
-                
-                if not photo_urls:
-                    logger.warning("⚠️ Не знайдено зображень на сторінці Threads.")
-                    return None
-                
-                # Визначаємо нікнейм автора
-                raw_title = extract_meta_title(html)
-                author_name = f"@{username}" if username else "Threads Artist"
-                
-                if raw_title:
-                    # Прибираємо "on Threads" з заголовку сторінки
-                    author_name = raw_title.split("on Threads")[0].strip() if "on Threads" in raw_title else raw_title
-                
-                if (not username or username == "None") and "@" in author_name:
-                    user_match = re.search(r'@([\w_.]+)', author_name)
-                    if user_match:
-                        username = user_match.group(1)
-                
-                author_link = f"https://www.threads.net/@{username}" if username else "https://www.threads.net"
-                
-                logger.info(f"🖼️ Знайдено оригінальних зображень Threads: {len(photo_urls)}")
-                return {
-                    "author_name": author_name,
-                    "author_link": author_link,
-                    "media_urls": photo_urls,
-                    "source_url": original_url
-                }
+                if response.status == 200:
+                    html = await response.text()
+                    photo_urls = extract_meta_images(html)
+                    if photo_urls:
+                        raw_title = extract_meta_title(html)
+                        author_name = f"@{username}" if username else "Threads Artist"
+                        if raw_title:
+                            author_name = raw_title.split("on Threads")[0].strip() if "on Threads" in raw_title else raw_title
+                        
+                        return {
+                            "author_name": author_name,
+                            "author_link": f"https://www.threads.net/@{username}" if username else "https://www.threads.net",
+                            "media_urls": photo_urls,
+                            "source_url": original_url
+                        }
         except Exception as e:
-            logger.error(f"💥 Помилка прямого сканування Threads: {e}")
+            logger.error(f"💥 Помилка резервного парсингу Threads: {e}")
+            
     return None
 
 async def get_instagram_media(code: str, original_url: str):
-    """Отримує чистий оригінальний арт з Instagram напряму, минаючи проксі-сервери"""
-    direct_url = f"https://www.instagram.com/p/{code}/"
-    logger.info(f"🔍 Пряме сканування Instagram: {direct_url}")
+    """Отримує ПОВНИЙ набір нестиснутих зображень з Instagram за допомогою JSON API"""
+    proxies = ["api.instagrame.com", "api.ddinstagram.com"]
     
-    headers = get_crawler_headers()
+    for domain in proxies:
+        api_url = f"https://{domain}/v1/post/{code}"
+        logger.info(f"🔍 Запит до Instagram JSON API ({domain}): {api_url}")
+        
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(api_url, timeout=12, ssl=False) as response:
+                    logger.info(f"📡 Instagram JSON API status: {response.status}")
+                    if response.status == 200:
+                        data = await response.json()
+                        item = data.get("item", {})
+                        if item:
+                            # Дістаємо автора
+                            author_data = item.get("author", {})
+                            author_name = author_data.get("username") or author_data.get("name") or "Instagram Artist"
+                            if not author_name.startswith("@") and author_name != "Instagram Artist":
+                                author_name = f"@{author_name}"
+                            author_link = f"https://www.instagram.com/{author_name.replace('@', '')}"
+                            
+                            # Збираємо всі нестиснуті фото з каруселі
+                            photo_urls = []
+                            media_list = item.get("media", [])
+                            for m in media_list:
+                                if m.get("type") in ["image", "photo"] or "video" not in m.get("type", "").lower():
+                                    url = m.get("url")
+                                    if url:
+                                        photo_urls.append(url.replace("&amp;", "&"))
+                                        
+                            if photo_urls:
+                                logger.info(f"📸 Знайдено {len(photo_urls)} чистих оригінальних фото Instagram через API")
+                                return {
+                                    "author_name": author_name,
+                                    "author_link": author_link,
+                                    "media_urls": photo_urls,
+                                    "source_url": original_url
+                                }
+            except Exception as e:
+                logger.error(f"💥 Помилка Instagram JSON API ({domain}): {e}")
+                
+    # РЕЗЕРВНИЙ ВАРІАНТ: Прямий парсинг сторінки
+    logger.warning("⚠️ Instagram API не повернув результат. Перемикаюсь на резервний HTML-парсинг...")
+    direct_url = f"https://www.instagram.com/p/{code}/"
+    headers = {"User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uated.html)"}
+    
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(direct_url, headers=headers, timeout=15, ssl=False) as response:
-                logger.info(f"📡 Instagram Direct статус відповіді: {response.status}")
-                if response.status != 200:
-                    return None
-                    
-                html = await response.text()
-                photo_urls = extract_meta_images(html)
-                
-                if not photo_urls:
-                    logger.warning("⚠️ Не знайдено зображень на сторінці Instagram.")
-                    return None
-                
-                # Визначення нікнейму автора
-                author_name = "Instagram Artist"
-                author_link = "https://www.instagram.com"
-                
-                raw_title = extract_meta_title(html)
-                if raw_title:
-                    author_name = raw_title
-                    user_match = re.search(r'@([\w_.]+)', raw_title)
-                    if user_match:
-                        username = user_match.group(1)
-                        author_link = f"https://www.instagram.com/{username}"
-                        author_name = f"@{username}"
-                
-                logger.info(f"🖼️ Знайдено оригінальних зображень Instagram: {len(photo_urls)}")
-                return {
-                    "author_name": author_name,
-                    "author_link": author_link,
-                    "media_urls": photo_urls,
-                    "source_url": original_url
-                }
+                if response.status == 200:
+                    html = await response.text()
+                    photo_urls = extract_meta_images(html)
+                    if photo_urls:
+                        raw_title = extract_meta_title(html)
+                        author_name = "Instagram Artist"
+                        author_link = "https://www.instagram.com"
+                        if raw_title:
+                            author_name = raw_title
+                            user_match = re.search(r'@([\w_.]+)', raw_title)
+                            if user_match:
+                                username = user_match.group(1)
+                                author_link = f"https://www.instagram.com/{username}"
+                                author_name = f"@{username}"
+                        
+                        return {
+                            "author_name": author_name,
+                            "author_link": author_link,
+                            "media_urls": photo_urls,
+                            "source_url": original_url
+                        }
         except Exception as e:
-            logger.error(f"💥 Помилка прямого сканування Instagram: {e}")
+            logger.error(f"💥 Помилка резервного парсингу Instagram: {e}")
+            
     return None
 
 def is_admin(user_id: int) -> bool:
@@ -304,8 +354,8 @@ async def cmd_start(message: types.Message):
         return
     await message.reply(
         "👋 Бот повністю оновлений!\n\n"
-        "Тепер для Instagram та Threads використовується чисте пряме "
-        "завантаження оригінальних файлів без водяних знаків та прев'ю-карток!"
+        "Тепер для Instagram та Threads інтегровано підтримку завантаження "
+        "**усіх зображень галереї (каруселей)** в оригінальній якості без обрізання!"
     )
 
 @dp.message(F.text)
@@ -322,10 +372,9 @@ async def handle_links(message: types.Message):
     if not any([twitter_match, pixiv_match, threads_match, instagram_match]):
         return
 
-    status_msg = await message.reply("⏳ Опрацьовую лінк та завантажую чисте медіа...")
+    status_msg = await message.reply("⏳ Починаю завантаження оригінальних зображень...")
     media_data = None
     
-    # Стандартні заголовки для скачування файлів з CDN
     headers_for_download = get_browser_headers()
 
     # 1. Твіттер
@@ -339,7 +388,7 @@ async def handle_links(message: types.Message):
         illust_id = pixiv_match.group(1)
         original_url = pixiv_match.group(0)
         media_data = await get_pixiv_media(illust_id, original_url)
-        headers_for_download = {}  # Для pixiv.cat заголовки не потрібні
+        headers_for_download = {}
         
     # 3. Threads
     elif threads_match:
@@ -372,7 +421,7 @@ async def handle_links(message: types.Message):
     else:
         warning_suffix = ""
 
-    await status_msg.edit_text(f"📥 Завантажую чисте зображення ({len(urls)} шт.)...")
+    await status_msg.edit_text(f"📥 Скачую оригінальні файли з CDN ({len(urls)} шт.)...")
 
     downloaded_images = []
     for url in urls:
@@ -403,7 +452,7 @@ async def handle_links(message: types.Message):
                 )
             await bot.send_media_group(chat_id=TARGET_CHAT_ID, media=media_group)
 
-        await status_msg.edit_text("✅ Арт успішно опубліковано!")
+        await status_msg.edit_text("✅ Арт успішно опубліковано у вашій групі!")
     except Exception as e:
         logger.error(f"💥 Помилка Telegram відправки: {e}")
         await status_msg.edit_text(f"❌ Помилка відправки в Telegram: {e}")
