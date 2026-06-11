@@ -30,14 +30,16 @@ dp = Dispatcher()
 # Регулярні вирази для лінків
 TWITTER_REGEX = r'https?://(?:www\.)?(?:twitter|x)\.com/([\w_]+)/status/(\d+)'
 PIXIV_REGEX = r'https?://(?:www\.)?pixiv\.net/(?:[\w-]+/)?artworks/(\d+)'
-THREADS_REGEX = r'https?://(?:www\.)?threads\.net/@([\w_.]+)/post/([\w_-]+)'
+# Оновлений вираз для Threads: підтримує /t/POST_ID та /@user/post/POST_ID
+THREADS_REGEX = r'https?://(?:www\.)?threads\.net/(?:@(?P<user>[\w_.]+)/post/|t/)(?P<id>[\w_-]+)'
 INSTAGRAM_REGEX = r'https?://(?:www\.)?instagram\.com/(?:[^/]+/)?(?:p|reel|reels)/([\w_-]+)'
 
 async def download_file(url: str, headers: dict = None) -> bytes:
     """Завантажує файл у бінарний буфер без збереження на диск"""
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(url, headers=headers, timeout=30) as response:
+            # Використовуємо ssl=False для уникнення проблем із сертифікатами на джерелах медіа
+            async with session.get(url, headers=headers, timeout=30, ssl=False) as response:
                 if response.status == 200:
                     return await response.read()
                 else:
@@ -145,7 +147,12 @@ async def get_pixiv_media(illust_id: str, original_url: str):
 
 async def get_threads_media(username: str, post_id: str, original_url: str):
     """Отримує медіа та дані автора з Threads за допомогою фіксера fixthreads.net"""
-    fixer_url = f"https://fixthreads.net/@{username}/post/{post_id}"
+    # Якщо нікнейм відсутній (для посилань типу /t/ID), робимо запит за ID
+    if username:
+        fixer_url = f"https://fixthreads.net/@{username}/post/{post_id}"
+    else:
+        fixer_url = f"https://fixthreads.net/t/{post_id}"
+        
     logger.info(f"🔍 Запит до Threads Fixer: {fixer_url}")
     
     headers = {
@@ -153,25 +160,46 @@ async def get_threads_media(username: str, post_id: str, original_url: str):
     }
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(fixer_url, headers=headers, timeout=15) as response:
+            # Використовуємо ssl=False для ігнорування можливих проблем із сертифікатами
+            async with session.get(fixer_url, headers=headers, timeout=15, ssl=False) as response:
                 logger.info(f"📡 Threads статус відповіді: {response.status}")
                 if response.status != 200:
                     return None
                 
                 html = await response.text()
                 
-                photo_urls = re.findall(r'<meta\s+(?:property|name)=["\'](?:og|twitter):image["\']\s+content=["\']([^"\']+)["\']', html)
-                photo_urls = list(dict.fromkeys([url for url in photo_urls if url and "pb=" not in url]))
+                # Пошук посилань на зображення
+                photo_urls = []
+                for match in re.finditer(r'<meta\s+[^>]*content=["\']([^"\']+)["\']', html):
+                    meta_tag = match.group(0)
+                    if 'og:image' in meta_tag or 'twitter:image' in meta_tag:
+                        url = match.group(1)
+                        if url and "pb=" not in url and url not in photo_urls:
+                            photo_urls.append(url)
                 
-                title_match = re.search(r'<meta\s+(?:property|name)=["\'](?:og|title|twitter:title)["\']\s+content=["\']([^"\']+)["\']', html)
-                author_name = f"@{username}"
-                if title_match:
-                    raw_title = title_match.group(1)
-                    author_name = raw_title.split("on Threads")[0].strip() if "on Threads" in raw_title else raw_title
+                # Парсимо ім'я автора з заголовка сторінки
+                title_match = re.search(r'<meta\s+[^>]*content=["\']([^"\']+)["\']', html) # шукаємо перший відповідний тег
+                author_name = f"@{username}" if username else "Threads Artist"
+                
+                # Спроба отримати точний нікнейм з title
+                for match in re.finditer(r'<meta\s+[^>]*content=["\']([^"\']+)["\']', html):
+                    meta_tag = match.group(0)
+                    if 'title' in meta_tag:
+                        raw_title = match.group(1)
+                        author_name = raw_title.split("on Threads")[0].strip() if "on Threads" in raw_title else raw_title
+                        break
+                
+                # Якщо посилання було /t/ і ми знайшли юзернейм автора в HTML
+                if not username and "@" in author_name:
+                    user_match = re.search(r'@([\w_.]+)', author_name)
+                    if user_match:
+                        username = user_match.group(1)
+                
+                author_link = f"https://www.threads.net/@{username}" if username else "https://www.threads.net"
                 
                 return {
                     "author_name": author_name,
-                    "author_link": f"https://www.threads.net/@{username}",
+                    "author_link": author_link,
                     "media_urls": photo_urls,
                     "source_url": original_url
                 }
@@ -180,9 +208,9 @@ async def get_threads_media(username: str, post_id: str, original_url: str):
     return None
 
 async def get_instagram_media(code: str, original_url: str):
-    """Отримує медіа та дані автора з Instagram за допомогою каскаду проксі-сервісів"""
-    # Список робочих дзеркал БЕЗ префіксу 'www.'
-    proxies = ["ddinstagram.com", "instagrame.com"]
+    """Отримує медіа та дані автора з Instagram за допомогою каскаду проксі-сервісів із вимкненим SSL-контролем"""
+    # Список робочих дзеркал (пріоритет на instagrame.com)
+    proxies = ["instagrame.com", "ddinstagram.com"]
     
     for domain in proxies:
         fixer_url = f"https://{domain}/p/{code}/"
@@ -194,34 +222,43 @@ async def get_instagram_media(code: str, original_url: str):
         
         async with aiohttp.ClientSession() as session:
             try:
-                async with session.get(fixer_url, headers=headers, timeout=15) as response:
+                # НАДВАЖЛИВО: ssl=False ігнорує помилки сертифікатів на проксі-сайтах
+                async with session.get(fixer_url, headers=headers, timeout=15, ssl=False) as response:
                     logger.info(f"📡 Instagram ({domain}) статус відповіді: {response.status}")
                     if response.status != 200:
                         continue
                     
                     html = await response.text()
                     
-                    # Пошук посилань на оригінальні зображення в OpenGraph-метатегах
-                    photo_urls = re.findall(r'<meta\s+(?:property|name)=["\'](?:og|twitter):image["\']\s+content=["\']([^"\']+)["\']', html)
-                    photo_urls = list(dict.fromkeys([url for url in photo_urls if url]))
+                    # Надійний пошук зображень в метатегах незалежно від черговості атрибутів
+                    photo_urls = []
+                    for match in re.finditer(r'<meta\s+[^>]*content=["\']([^"\']+)["\']', html):
+                        meta_tag = match.group(0)
+                        if 'og:image' in meta_tag or 'twitter:image' in meta_tag:
+                            url = match.group(1)
+                            if url and url not in photo_urls:
+                                photo_urls.append(url)
                     
                     if not photo_urls:
                         logger.warning(f"⚠️ На {domain} не знайдено посилань на картинки, спробую інший проксі...")
                         continue
                     
                     # Визначення нікнейму автора
-                    title_match = re.search(r'<meta\s+(?:property|name)=["\'](?:og|title|twitter:title)["\']\s+content=["\']([^"\']+)["\']', html)
                     author_name = "Instagram Artist"
                     author_link = "https://www.instagram.com"
                     
-                    if title_match:
-                        raw_title = title_match.group(1)
-                        author_name = raw_title
-                        user_match = re.search(r'@([\w_.]+)', raw_title)
-                        if user_match:
-                            username = user_match.group(1)
-                            author_link = f"https://www.instagram.com/{username}"
-                            author_name = f"@{username}"
+                    # Шукаємо метатег title для визначення автора
+                    for match in re.finditer(r'<meta\s+[^>]*content=["\']([^"\']+)["\']', html):
+                        meta_tag = match.group(0)
+                        if 'title' in meta_tag:
+                            raw_title = match.group(1)
+                            author_name = raw_title
+                            user_match = re.search(r'@([\w_.]+)', raw_title)
+                            if user_match:
+                                username = user_match.group(1)
+                                author_link = f"https://www.instagram.com/{username}"
+                                author_name = f"@{username}"
+                            break
                     
                     return {
                         "author_name": author_name,
@@ -284,7 +321,8 @@ async def handle_links(message: types.Message):
         
     # 3. Threads
     elif threads_match:
-        username, post_id = threads_match.groups()
+        username = threads_match.group("user")
+        post_id = threads_match.group("id")
         original_url = threads_match.group(0)
         media_data = await get_threads_media(username, post_id, original_url)
         
