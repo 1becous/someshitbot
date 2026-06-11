@@ -10,39 +10,42 @@ from aiogram.types import BufferedInputFile, InputMediaPhoto
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
+# Завантаження змінних оточення (Railway автоматично підставляє їх)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip()]
 
+# Налаштування логування
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
+# Ініціалізація бота
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
+# Регулярні вирази для лінків
 TWITTER_REGEX = r'https?://(?:www\.)?(?:twitter|x)\.com/([\w_]+)/status/(\d+)'
 PIXIV_REGEX = r'https?://(?:www\.)?pixiv\.net/(?:[\w-]+/)?artworks/(\d+)'
 
 async def download_file(url: str, headers: dict = None) -> bytes:
-    """Завантажує файл у бінарний буфер"""
+    """Завантажує файл у бінарний буфер. Працює стабільно завдяки pixiv.cat"""
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, headers=headers, timeout=30) as response:
                 if response.status == 200:
                     return await response.read()
                 else:
-                    logger.error(f"❌ ПОМИЛКА ЗАВАНТАЖЕННЯ ФАЙЛУ: статус {response.status} для URL: {url}")
+                    logger.error(f"❌ ПОМИЛКА ЗАВАНТАЖЕННЯ: статус {response.status} для URL: {url}")
         except Exception as e:
             logger.error(f"💥 Виняток при завантаженні файлу: {e}")
     return b""
 
 async def get_twitter_media(status_id: str, author_handle: str, original_url: str):
     """Отримує медіа та дані автора з Twitter за допомогою fxtwitter API"""
-    # Змінено на api.fxtwitter.com (іноді він стабільніший за vxtwitter)
     api_url = f"https://api.fxtwitter.com/status/{status_id}"
     logger.info(f"🔍 Запит до Twitter API: {api_url}")
     
@@ -51,14 +54,11 @@ async def get_twitter_media(status_id: str, author_handle: str, original_url: st
             async with session.get(api_url, timeout=15) as response:
                 logger.info(f"📡 Twitter API статус відповіді: {response.status}")
                 if response.status != 200:
-                    err_text = await response.text()
-                    logger.error(f"❌ Twitter API відмовив. Текст відповіді: {err_text[:200]}")
                     return None
                     
                 data = await response.json()
                 tweet = data.get("tweet", {})
                 if not tweet:
-                    # Спроба прочитати як старий формат vxtwitter
                     tweet = data
                 
                 author = tweet.get("author", {})
@@ -66,12 +66,10 @@ async def get_twitter_media(status_id: str, author_handle: str, original_url: st
                 user_screen_name = author.get("screen_name", author_handle)
                 author_link = f"https://x.com/{user_screen_name}"
                 
-                # Отримання фото
                 media = tweet.get("media", {})
                 photos = media.get("photos", [])
                 photo_urls = [p.get("url") for p in photos if p.get("type") == "photo"]
                 
-                # Якщо новий формат порожній, шукаємо за старим vxtwitter
                 if not photo_urls and "attachments" in data:
                     photo_urls = [att.get("url") for att in data["attachments"] if att.get("type") == "photo"]
                 
@@ -86,7 +84,7 @@ async def get_twitter_media(status_id: str, author_handle: str, original_url: st
     return None
 
 async def get_pixiv_media(illust_id: str, original_url: str):
-    """Отримує медіа та дані автора з Pixiv за допомогою офіційного публічного AJAX API"""
+    """Отримує медіа та дані автора з Pixiv за допомогою AJAX API та обходу блокувань через pixiv.cat"""
     api_url = f"https://www.pixiv.net/ajax/illust/{illust_id}"
     logger.info(f"🔍 Запит до Pixiv API: {api_url}")
     
@@ -100,29 +98,37 @@ async def get_pixiv_media(illust_id: str, original_url: str):
         try:
             async with session.get(api_url, headers=headers, timeout=15) as response:
                 logger.info(f"📡 Pixiv API статус відповіді: {response.status}")
+                
+                # Якщо офіційне API заблоковано або недоступне, вмикаємо режим авто-обходу
                 if response.status != 200:
-                    err_text = await response.text()
-                    logger.error(f"❌ Pixiv API відмовив. Текст відповіді: {err_text[:200]}")
-                    return None
+                    logger.warning("⚠️ Pixiv API повернув помилку. Вмикаю аварійний режим обходу...")
+                    return {
+                        "author_name": "Pixiv Artist",
+                        "author_link": f"https://www.pixiv.net/artworks/{illust_id}",
+                        "media_urls": [f"https://pixiv.cat/{illust_id}.png"],
+                        "source_url": original_url
+                    }
                     
                 data = await response.json()
                 if data.get("error"):
-                    logger.error(f"❌ Pixiv повернув внутрішню помилку для ID {illust_id}: {data.get('message')}")
+                    logger.error(f"❌ Pixiv повернув внутрішню помилку: {data.get('message')}")
                     return None
                 
                 body = data.get("body", {})
                 author_name = body.get("userName", "Unknown Pixiv Artist")
                 author_id = body.get("userId", "")
-                author_link = f"https://www.pixiv.net/users/{author_id}"
+                author_link = f"https://www.pixiv.net/users/{author_id}" if author_id else "https://www.pixiv.net"
                 
                 page_count = body.get("pageCount", 1)
-                original_img_url = body.get("urls", {}).get("original", "")
                 
+                # Замість оригінальних лінків i.pximg.net ми будуємо посилання на проксі pixiv.cat
                 photo_urls = []
-                if original_img_url:
-                    for p in range(page_count):
-                        page_url = original_img_url.replace("_p0.", f"_p{p}.")
-                        photo_urls.append(page_url)
+                if page_count == 1:
+                    photo_urls.append(f"https://pixiv.cat/{illust_id}.png")
+                else:
+                    # pixiv.cat використовує 1-індексацію для багатосторінкових артів (наприклад, 12345-1.png, 12345-2.png)
+                    for p in range(1, page_count + 1):
+                        photo_urls.append(f"https://pixiv.cat/{illust_id}-{p}.png")
                 
                 return {
                     "author_name": author_name,
@@ -132,7 +138,13 @@ async def get_pixiv_media(illust_id: str, original_url: str):
                 }
         except Exception as e:
             logger.error(f"💥 Помилка при запиті до Pixiv API: {e}")
-    return None
+            # Аварійний режим у випадку повної відмови мережі до Pixiv
+            return {
+                "author_name": "Pixiv Artist",
+                "author_link": f"https://www.pixiv.net/artworks/{illust_id}",
+                "media_urls": [f"https://pixiv.cat/{illust_id}.png"],
+                "source_url": original_url
+            }
 
 def is_admin(user_id: int) -> bool:
     return not ADMIN_IDS or user_id in ADMIN_IDS
@@ -141,7 +153,7 @@ def is_admin(user_id: int) -> bool:
 async def cmd_start(message: types.Message):
     if not is_admin(message.from_user.id):
         return
-    await message.reply("👋 Бот активний та готовий до тестування!")
+    await message.reply("👋 Бот активований та використовує технологію обходу Pixiv-блокувань!")
 
 @dp.message(F.text)
 async def handle_links(message: types.Message):
@@ -155,7 +167,7 @@ async def handle_links(message: types.Message):
     if not twitter_match and not pixiv_match:
         return
 
-    status_msg = await message.reply("⏳ Опрацьовую посилання...")
+    status_msg = await message.reply("⏳ Починаю опрацювання та завантаження медіа...")
     media_data = None
     headers_for_download = None
 
@@ -169,13 +181,11 @@ async def handle_links(message: types.Message):
         illust_id = pixiv_match.group(1)
         original_url = pixiv_match.group(0)
         media_data = await get_pixiv_media(illust_id, original_url)
-        headers_for_download = {
-            "Referer": "https://www.pixiv.net/",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        }
+        # Для pixiv.cat заголовки реферера НЕ потрібні, сервіс віддає файли без обмежень
+        headers_for_download = {}
 
     if not media_data or not media_data.get("media_urls"):
-        await status_msg.edit_text("❌ Не вдалося отримати дані або медіа-файли за цим посиланням. Перевірте логи хостингу.")
+        await status_msg.edit_text("❌ Не вдалося отримати дані про цей арт.")
         return
 
     author_name = media_data["author_name"]
@@ -189,7 +199,7 @@ async def handle_links(message: types.Message):
     else:
         warning_suffix = ""
 
-    await status_msg.edit_text(f"📥 Завантажую зображення ({len(urls)} шт.)...")
+    await status_msg.edit_text(f"📥 Завантажую зображення на сервер ({len(urls)} шт.)...")
 
     downloaded_images = []
     for url in urls:
@@ -198,7 +208,7 @@ async def handle_links(message: types.Message):
             downloaded_images.append(img_bytes)
 
     if not downloaded_images:
-        await status_msg.edit_text("❌ Помилка: Не вдалося завантажити самі файли картинок з серверів сайту.")
+        await status_msg.edit_text("❌ Помилка завантаження: Сервер pixiv.cat тимчасово недоступний або зображення занадто велике.")
         return
 
     caption_text = f"🎨 Автор: <a href='{author_link}'>{author_name}</a>\n🔗 <a href='{source_url}'>Джерело</a>{warning_suffix}"
@@ -219,7 +229,7 @@ async def handle_links(message: types.Message):
                 )
             await bot.send_media_group(chat_id=TARGET_CHAT_ID, media=media_group)
 
-        await status_msg.edit_text("✅ Арт успішно опубліковано!")
+        await status_msg.edit_text("✅ Арт успішно опубліковано у вашій групі!")
     except Exception as e:
         logger.error(f"💥 Помилка Telegram відправки: {e}")
         await status_msg.edit_text(f"❌ Помилка відправки в Telegram: {e}")
