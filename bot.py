@@ -27,20 +27,18 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# Регулярні вирази для лінків (додано прапорець IGNORECASE та підтримку threads.com)
+# Регулярні вирази для лінків (додано підтримку threads.com та threads.net у будь-якому регістрі)
 TWITTER_REGEX = re.compile(r'https?://(?:www\.)?(?:twitter|x)\.com/([\w_]+)/status/(\d+)', re.IGNORECASE)
 PIXIV_REGEX = re.compile(r'https?://(?:www\.)?pixiv\.net/(?:[\w-]+/)?artworks/(\d+)', re.IGNORECASE)
 THREADS_REGEX = re.compile(r'https?://(?:www\.)?threads\.(?:net|com)/(?:@(?P<user>[\w_.]+)/post/|t/)(?P<id>[\w_-]+)', re.IGNORECASE)
 INSTAGRAM_REGEX = re.compile(r'https?://(?:www\.)?instagram\.com/(?:[^/]+/)?(?:p|reel|reels)/([\w_-]+)', re.IGNORECASE)
 
 def get_browser_headers(referer: str = None) -> dict:
-    """Генерує реалістичні заголовки сучасного браузера Chrome для обходу блокувань CDN"""
+    """Генерує реалістичні заголовки для обходу блокувань CDN"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
         "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Agent";v="99"',
-        "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": '"Windows"',
         "Sec-Fetch-Dest": "image",
         "Sec-Fetch-Mode": "no-cors",
@@ -49,6 +47,32 @@ def get_browser_headers(referer: str = None) -> dict:
     if referer:
         headers["Referer"] = referer
     return headers
+
+def extract_meta_images(html: str) -> list:
+    """Витягує посилання на зображення з OpenGraph метатегів сторінки"""
+    photo_urls = []
+    # Шукаємо всі метатеги
+    meta_tags = re.findall(r'<meta\s+[^>]*>', html, re.IGNORECASE)
+    for tag in meta_tags:
+        tag_lower = tag.lower()
+        if 'og:image' in tag_lower or 'twitter:image' in tag_lower or 'og:image:secure_url' in tag_lower:
+            content_match = re.search(r'content=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+            if content_match:
+                # КРИТИЧНО: Заміна &amp; на & для валідності посилань Meta CDN
+                url = content_match.group(1).replace("&amp;", "&")
+                if url and "pb=" not in url and url not in photo_urls:
+                    photo_urls.append(url)
+    return photo_urls
+
+def extract_meta_title(html: str) -> str:
+    """Витягує заголовок OpenGraph для визначення автора"""
+    meta_tags = re.findall(r'<meta\s+[^>]*>', html, re.IGNORECASE)
+    for tag in meta_tags:
+        if 'title' in tag.lower():
+            content_match = re.search(r'content=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+            if content_match:
+                return content_match.group(1)
+    return ""
 
 async def download_file(url: str, headers: dict = None) -> bytes:
     """Завантажує файл у бінарний буфер без збереження на диск"""
@@ -61,7 +85,7 @@ async def download_file(url: str, headers: dict = None) -> bytes:
                 if response.status == 200:
                     return await response.read()
                 else:
-                    logger.error(f"❌ ПОМИЛКА ЗАВАНТАЖЕННЯ ФАЙЛУ: статус {response.status} для URL: {url[:100]}...")
+                    logger.error(f"❌ ПОМИЛКА ЗАВАНТАЖЕННЯ ФАЙЛУ: статус {response.status} для URL: {url[:80]}...")
         except Exception as e:
             logger.error(f"💥 Виняток при завантаженні файлу: {e}")
     return b""
@@ -164,118 +188,55 @@ async def get_pixiv_media(illust_id: str, original_url: str):
             }
 
 async def get_threads_media(username: str, post_id: str, original_url: str):
-    """Отримує медіа та дані автора з Threads за допомогою фіксера fixthreads.net"""
+    """Отримує медіа та дані автора з Threads за допомогою каскаду прямого запиту та проксі-серверів"""
+    # Будуємо каскад джерел
+    endpoints = []
+    
+    # 1. Спроба прямого запиту до оригінального Threads (найбільш надійний метод без посередників)
     if username:
-        fixer_url = f"https://fixthreads.net/@{username}/post/{post_id}"
-    else:
-        fixer_url = f"https://fixthreads.net/t/{post_id}"
-        
-    logger.info(f"🔍 Запит до Threads Fixer: {fixer_url}")
+        endpoints.append((f"https://www.threads.net/@{username}/post/{post_id}", "Threads Direct"))
+    endpoints.append((f"https://www.threads.net/t/{post_id}", "Threads Direct (Short)"))
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
-    }
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(fixer_url, headers=headers, timeout=15, ssl=False) as response:
-                logger.info(f"📡 Threads статус відповіді: {response.status}")
-                if response.status != 200:
-                    return None
-                
-                html = await response.text()
-                
-                # Пошук посилань на зображення та виправлення &amp;
-                photo_urls = []
-                meta_tags = re.findall(r'<meta\s+[^>]*>', html, re.IGNORECASE)
-                for tag in meta_tags:
-                    if 'og:image' in tag.lower() or 'twitter:image' in tag.lower():
-                        content_match = re.search(r'content=["\']([^"\']+)["\']', tag, re.IGNORECASE)
-                        if content_match:
-                            url = content_match.group(1).replace("&amp;", "&")
-                            if url and "pb=" not in url and url not in photo_urls:
-                                photo_urls.append(url)
-                
-                author_name = f"@{username}" if username else "Threads Artist"
-                
-                # Пошук нікнейму автора
-                for tag in meta_tags:
-                    if 'title' in tag.lower():
-                        content_match = re.search(r'content=["\']([^"\']+)["\']', tag, re.IGNORECASE)
-                        if content_match:
-                            raw_title = content_match.group(1)
-                            author_name = raw_title.split("on Threads")[0].strip() if "on Threads" in raw_title else raw_title
-                            break
-                
-                if not username and "@" in author_name:
-                    user_match = re.search(r'@([\w_.]+)', author_name)
-                    if user_match:
-                        username = user_match.group(1)
-                
-                author_link = f"https://www.threads.net/@{username}" if username else "https://www.threads.net"
-                
-                return {
-                    "author_name": author_name,
-                    "author_link": author_link,
-                    "media_urls": photo_urls,
-                    "source_url": original_url
-                }
-        except Exception as e:
-            logger.error(f"💥 Помилка парсингу Threads: {e}")
-    return None
+    # 2. Резервна спроба через фіксер-проксі
+    if username:
+        endpoints.append((f"https://fixthreads.net/@{username}/post/{post_id}", "FixThreads Proxy"))
+    endpoints.append((f"https://fixthreads.net/t/{post_id}", "FixThreads Proxy (Short)"))
 
-async def get_instagram_media(code: str, original_url: str):
-    """Отримує медіа та дані автора з Instagram за допомогою каскаду проксі-сервісів"""
-    proxies = ["instagrame.com", "ddinstagram.com"]
-    
-    for domain in proxies:
-        fixer_url = f"https://{domain}/p/{code}/"
-        logger.info(f"🔍 Спроба отримати Instagram через: {fixer_url}")
+    for url, source_name in endpoints:
+        logger.info(f"🔍 Спроба отримати Threads з {source_name}: {url}")
         
+        # Імітуємо офіційного Discord бота для отримання метатегів прев'ю
         headers = {
             "User-Agent": "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
         }
         
         async with aiohttp.ClientSession() as session:
             try:
-                async with session.get(fixer_url, headers=headers, timeout=15, ssl=False) as response:
-                    logger.info(f"📡 Instagram ({domain}) статус відповіді: {response.status}")
+                async with session.get(url, headers=headers, timeout=15, ssl=False) as response:
+                    logger.info(f"📡 {source_name} статус відповіді: {response.status}")
                     if response.status != 200:
                         continue
                     
                     html = await response.text()
-                    
-                    # Надійний пошук зображень в метатегах + ОБОВ'ЯЗКОВЕ виправлення &amp; на &
-                    photo_urls = []
-                    meta_tags = re.findall(r'<meta\s+[^>]*>', html, re.IGNORECASE)
-                    for tag in meta_tags:
-                        if 'og:image' in tag.lower() or 'twitter:image' in tag.lower() or 'og:image:secure_url' in tag.lower():
-                            content_match = re.search(r'content=["\']([^"\']+)["\']', tag, re.IGNORECASE)
-                            if content_match:
-                                # Заміна &amp; на & є критичною для запобігання помилок 403 на серверах Meta CDN!
-                                url = content_match.group(1).replace("&amp;", "&")
-                                if url and url not in photo_urls:
-                                    photo_urls.append(url)
+                    photo_urls = extract_meta_images(html)
                     
                     if not photo_urls:
-                        logger.warning(f"⚠️ На {domain} не знайдено посилань на картинки, спробую інший проксі...")
+                        logger.warning(f"⚠️ На {source_name} не знайдено зображень у метатегах.")
                         continue
                     
-                    # Визначення нікнейму автора
-                    author_name = "Instagram Artist"
-                    author_link = "https://www.instagram.com"
+                    # Визначаємо автора публікації
+                    raw_title = extract_meta_title(html)
+                    author_name = f"@{username}" if username else "Threads Artist"
                     
-                    for tag in meta_tags:
-                        if 'title' in tag.lower():
-                            content_match = re.search(r'content=["\']([^"\']+)["\']', tag, re.IGNORECASE)
-                            if content_match:
-                                raw_title = content_match.group(1)
-                                author_name = raw_title
-                                user_match = re.search(r'@([\w_.]+)', raw_title)
-                                if user_match:
-                                    username = user_match.group(1)
-                                    author_link = f"https://www.instagram.com/{username}"
-                                    author_name = f"@{username}"
-                                break
+                    if raw_title:
+                        author_name = raw_title.split("on Threads")[0].strip() if "on Threads" in raw_title else raw_title
+                    
+                    if (not username or username == "None") and "@" in author_name:
+                        user_match = re.search(r'@([\w_.]+)', author_name)
+                        if user_match:
+                            username = user_match.group(1)
+                    
+                    author_link = f"https://www.threads.net/@{username}" if username else "https://www.threads.net"
                     
                     return {
                         "author_name": author_name,
@@ -284,7 +245,62 @@ async def get_instagram_media(code: str, original_url: str):
                         "source_url": original_url
                     }
             except Exception as e:
-                logger.error(f"💥 Помилка підключення до Instagram проксі ({domain}): {e}")
+                logger.error(f"💥 Помилка підключення до {source_name}: {e}")
+                continue
+                
+    logger.error("❌ Жодне з джерел Threads не змогло повернути результат.")
+    return None
+
+async def get_instagram_media(code: str, original_url: str):
+    """Отримує медіа та дані автора з Instagram за допомогою каскаду прямого запиту та проксі-серверів"""
+    endpoints = [
+        (f"https://www.instagram.com/p/{code}/", "Instagram Direct"),
+        (f"https://instagrame.com/p/{code}/", "Instagrame Proxy"),
+        (f"https://ddinstagram.com/p/{code}/", "DDInstagram Proxy")
+    ]
+    
+    for url, source_name in endpoints:
+        logger.info(f"🔍 Спроба отримати Instagram з {source_name}: {url}")
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(url, headers=headers, timeout=15, ssl=False) as response:
+                    logger.info(f"📡 {source_name} статус відповіді: {response.status}")
+                    if response.status != 200:
+                        continue
+                    
+                    html = await response.text()
+                    photo_urls = extract_meta_images(html)
+                    
+                    if not photo_urls:
+                        logger.warning(f"⚠️ На {source_name} не знайдено посилань на картинки.")
+                        continue
+                    
+                    # Визначення нікнейму автора
+                    author_name = "Instagram Artist"
+                    author_link = "https://www.instagram.com"
+                    
+                    raw_title = extract_meta_title(html)
+                    if raw_title:
+                        author_name = raw_title
+                        user_match = re.search(r'@([\w_.]+)', raw_title)
+                        if user_match:
+                            username = user_match.group(1)
+                            author_link = f"https://www.instagram.com/{username}"
+                            author_name = f"@{username}"
+                    
+                    return {
+                        "author_name": author_name,
+                        "author_link": author_link,
+                        "media_urls": photo_urls,
+                        "source_url": original_url
+                    }
+            except Exception as e:
+                logger.error(f"💥 Помилка підключення до {source_name}: {e}")
                 continue
                 
     logger.error("❌ Жоден з проксі-серверів Instagram не зміг повернути результат.")
@@ -298,11 +314,11 @@ async def cmd_start(message: types.Message):
     if not is_admin(message.from_user.id):
         return
     await message.reply(
-        "👋 Бот оновлений та готовий до роботи!\n\n"
+        "👋 Бот повністю оновлений та готовий!\n\n"
         "• Twitter (X)\n"
         "• Pixiv\n"
-        "• Threads (підтримка threads.com та threads.net)\n"
-        "• Instagram (виправлено помилки 403)"
+        "• Threads (Каскадний обхід помилок 502)\n"
+        "• Instagram (Каскадний обхід помилок 403)"
     )
 
 @dp.message(F.text)
@@ -322,7 +338,7 @@ async def handle_links(message: types.Message):
     status_msg = await message.reply("⏳ Опрацьовую лінк та завантажую медіа...")
     media_data = None
     
-    # Створюємо правильні заголовки завантаження (імітуємо браузер для Meta CDN)
+    # Імітуємо браузер для Meta CDN
     headers_for_download = get_browser_headers()
 
     # 1. Твіттер
@@ -344,7 +360,6 @@ async def handle_links(message: types.Message):
         post_id = threads_match.group("id")
         original_url = threads_match.group(0)
         media_data = await get_threads_media(username, post_id, original_url)
-        # Додаємо реферер Threads для CDN-запитів
         headers_for_download = get_browser_headers("https://www.threads.net/")
         
     # 4. Instagram
@@ -352,7 +367,6 @@ async def handle_links(message: types.Message):
         code = instagram_match.group(1)
         original_url = instagram_match.group(0)
         media_data = await get_instagram_media(code, original_url)
-        # Додаємо реферер Instagram для CDN-запитів
         headers_for_download = get_browser_headers("https://www.instagram.com/")
 
     # Перевірка отриманих даних
